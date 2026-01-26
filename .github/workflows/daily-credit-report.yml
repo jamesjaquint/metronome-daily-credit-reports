@@ -2,9 +2,9 @@ name: Daily Credit Report
 
 on:
   schedule:
-    # Run at 6 AM EST (11 AM UTC) every day
+    # 11:00 UTC daily (6:00 AM EST / 5:00 AM CST)
     - cron: '0 11 * * *'
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:  # Manual trigger
 
 jobs:
   generate-report:
