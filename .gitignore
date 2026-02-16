@@ -7,6 +7,5 @@ logs/
 *.pyc
 __pycache__/
 lambda_package.zip
-overage_audit.py
 overage_audit*.csv
 .DS_Store
