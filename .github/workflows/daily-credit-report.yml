@@ -35,6 +35,14 @@ jobs:
         run: |
           python credit_report.py
 
+      - name: Run Shahid analytics weekly report
+        env:
+          METRONOME_API_KEY: ${{ secrets.METRONOME_API_KEY }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          SHAHID_SPREADSHEET_ID: ${{ secrets.SHAHID_SPREADSHEET_ID }}
+        run: |
+          python shahid_analytics_weekly.py
+
       - name: Cleanup
         if: always()
         run: |
