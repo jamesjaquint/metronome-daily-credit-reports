@@ -338,15 +338,8 @@ def main():
         w = weekly_data[wk]
         print(f"    {w['week']} ({w['week_start']} to {w['week_end']}): {w['analytics_credits']:,.2f} credits ({w['days_with_data']} days)")
 
-    # Write to Google Sheet
-    # Pre-create a Google Sheet and share with: metronome-lambda@doc-writer-jjaquint.iam.gserviceaccount.com
-    spreadsheet_id = os.getenv('SHAHID_SPREADSHEET_ID')
-    if not spreadsheet_id:
-        print("\n  ERROR: Set SHAHID_SPREADSHEET_ID env var (or add to .env)")
-        print("  1. Create a blank Google Sheet")
-        print("  2. Share it (Editor) with: metronome-lambda@doc-writer-jjaquint.iam.gserviceaccount.com")
-        print("  3. Add SHAHID_SPREADSHEET_ID=<sheet_id> to .env")
-        return
+    # Write to Google Sheet (shared with service account)
+    spreadsheet_id = '1YN14i7dx6-MX295S6pfzOEYqNCCuWggNRO8tYqvhZ5U'
 
     print(f"\n  Authenticating with Google...")
     creds = get_google_creds()
