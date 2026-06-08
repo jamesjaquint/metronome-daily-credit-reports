@@ -2,10 +2,14 @@ name: Monthly Overage Audit
 
 on:
   schedule:
-    # 2nd of each month at 7:00 UTC (2:00 AM EST / 1:00 AM CST)
+    # 2nd of each month at 8:37 UTC. Staggered away from the top of the hour
+    # because GitHub scheduled workflows can be delayed or dropped during load.
     # Invoices finalize on the 1st, so we audit the day after
-    - cron: '0 7 2 * *'
+    - cron: '37 8 2 * *'
   workflow_dispatch:  # Manual trigger for backfills
+
+permissions:
+  contents: write
 
 jobs:
   overage-audit:
@@ -13,10 +17,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -40,3 +44,37 @@ jobs:
         if: always()
         run: |
           rm -f service-account.json
+
+      - name: Record automation heartbeat
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+
+          mkdir -p .github/automation
+          {
+            echo "workflow=Monthly Overage Audit"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "updated_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > .github/automation/monthly-overage-audit-last-run.txt
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/automation/monthly-overage-audit-last-run.txt
+
+          if git diff --cached --quiet; then
+            echo "No heartbeat changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: record monthly overage audit heartbeat"
+          git push
+          status=$?
+
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::Could not push heartbeat commit; monthly audit result is unaffected."
+          fi
+
+          exit 0
