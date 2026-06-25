@@ -354,45 +354,52 @@ def build_daily_usage(customer_id, months_back=2, plan_start=None, report_start=
     return list(daily_usage.values()), monthly_invoice_totals
 
 def get_current_balance(grants):
-    """Summarize credits across ALL grants to match Metronome's Credits tab.
+    """Summarize credits all-time AND for the current contract year.
 
-    Returns (total_granted, available, consumed, expired, plan_start):
-      - total_granted: sum of every grant amount (all time)
-      - consumed:      sum of all non-expiry deductions (incl. pending)
-      - expired:       sum of deductions whose reason is 'Credits expired'
-      - available:     total_granted - consumed - expired
-      - plan_start:    earliest currently-active grant (default date anchor)
+    Returns (summary, plan_start). `summary` has two dicts, 'all' and
+    'current', each with granted / consumed / expired / available:
+      - granted:   sum of grant amounts
+      - consumed:  sum of non-expiry deductions (incl. pending)
+      - expired:   sum of 'Credits expired' deductions
+      - available: granted - consumed - expired
+    'current' counts only grants active today (effective_at <= now <
+    expires_at) -- i.e. the live contract-year commit. 'all' matches
+    Metronome's Credits tab. plan_start = earliest active grant (date anchor).
     """
     now = datetime.now(tz=__import__('datetime').timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
-    total_granted = 0.0
-    consumed = 0.0
-    expired = 0.0
+    allt = {'granted': 0.0, 'consumed': 0.0, 'expired': 0.0}
+    cur = {'granted': 0.0, 'consumed': 0.0, 'expired': 0.0}
     earliest_active = None
 
     for grant in grants:
-        total_granted += grant.get('grant_amount', {}).get('amount', 0)
-
-        for ded in grant.get('deductions', []):
-            amt = -ded.get('amount', 0)  # deductions are negative
-            if 'expir' in ded.get('reason', '').lower():
-                expired += amt
-            else:
-                consumed += amt
-        for pd in grant.get('pending_deductions', []):
-            consumed += -pd.get('amount', 0)
-
         effective_at = grant.get('effective_at', '')
         expires_at = grant.get('expires_at', '')
-        if effective_at <= now < expires_at:
-            if earliest_active is None or effective_at < earliest_active:
-                earliest_active = effective_at
+        is_active = effective_at <= now < expires_at
+        buckets = [allt] + ([cur] if is_active else [])
 
-    available = total_granted - consumed - expired
+        amt = grant.get('grant_amount', {}).get('amount', 0)
+        for b in buckets:
+            b['granted'] += amt
+        for ded in grant.get('deductions', []):
+            d = -ded.get('amount', 0)  # deductions are negative
+            key = 'expired' if 'expir' in ded.get('reason', '').lower() else 'consumed'
+            for b in buckets:
+                b[key] += d
+        for pd in grant.get('pending_deductions', []):
+            for b in buckets:
+                b['consumed'] += -pd.get('amount', 0)
+
+        if is_active and (earliest_active is None or effective_at < earliest_active):
+            earliest_active = effective_at
+
+    for b in (allt, cur):
+        b['available'] = b['granted'] - b['consumed'] - b['expired']
+
     plan_start = None
     if earliest_active:
         plan_start = datetime.strptime(earliest_active[:10], '%Y-%m-%d')
 
-    return total_granted, available, consumed, expired, plan_start
+    return {'all': allt, 'current': cur}, plan_start
 
 def ensure_sheet_exists(service, spreadsheet_id, sheet_name):
     """Ensure a sheet exists, create if not."""
@@ -560,8 +567,10 @@ def update_spreadsheet(service, spreadsheet_id, customer_name, daily_usage, invo
         body={'values': monthly_headers + monthly_rows}
     ).execute()
 
-    # Credit Usage Summary (mirrors Metronome Credits tab)
-    total_granted, available, consumed, expired, _ = get_current_balance(grants)
+    # Credit Usage Summary: current contract year first, then all-time
+    credit_summary, _ = get_current_balance(grants)
+    cur = credit_summary['current']
+    allt = credit_summary['all']
 
     summary = [
         ['Metric', 'Value'],
@@ -569,12 +578,17 @@ def update_spreadsheet(service, spreadsheet_id, customer_name, daily_usage, invo
         ['Report Date', datetime.now().strftime('%Y-%m-%d %H:%M')],
         ['Data Source', 'Invoices + Daily Breakdowns (reconciled); credits from listGrants'],
         ['', ''],
-        ['=== Credit Balance (Metronome Credits tab) ===', ''],
-        ['Available Balance', round(available, 2)],
-        ['Consumed', round(consumed, 2)],
-        ['Expired', round(expired, 2)],
-        ['Total Granted', round(total_granted, 2)],
-        ['Consumed %', f"{(consumed/total_granted*100):.1f}%" if total_granted > 0 else 'N/A'],
+        ['=== Current Contract Year (active grants) ===', ''],
+        ['Available Balance', round(cur['available'], 2)],
+        ['Consumed', round(cur['consumed'], 2)],
+        ['Total Granted', round(cur['granted'], 2)],
+        ['Consumed %', f"{(cur['consumed']/cur['granted']*100):.1f}%" if cur['granted'] > 0 else 'N/A'],
+        ['', ''],
+        ['=== All-Time (matches Metronome Credits tab) ===', ''],
+        ['Available Balance', round(allt['available'], 2)],
+        ['Consumed', round(allt['consumed'], 2)],
+        ['Expired', round(allt['expired'], 2)],
+        ['Total Granted', round(allt['granted'], 2)],
         ['', ''],
         ['=== Credit Grants (when applied) ===', ''],
         ['Applied (Effective)', 'Amount (Expires)'],
@@ -642,7 +656,7 @@ def process_customer(service, customer, customers, customers_modified):
     print(f"  Found {len(grants)} grants")
 
     # Get balance and plan start date
-    total_granted, available, consumed, expired, plan_start = get_current_balance(grants)
+    credit_summary, plan_start = get_current_balance(grants)
 
     # Optional per-customer report start (e.g. plan/contract start date)
     report_start = None
@@ -660,7 +674,8 @@ def process_customer(service, customer, customers, customers_modified):
 
     # Print summary
     print(f"\n  Summary:")
-    print(f"    Available: {available:,.2f} credits (granted {total_granted:,.0f}, consumed {consumed:,.0f}, expired {expired:,.0f})")
+    cur = credit_summary['current']
+    print(f"    Current contract: available {cur['available']:,.0f} of {cur['granted']:,.0f} granted (consumed {cur['consumed']:,.0f})")
     for month in sorted(monthly_totals.keys(), key=lambda mk: datetime.strptime(mk, '%b %Y'), reverse=True):
         print(f"    {month}: {monthly_totals[month]['total']:,.2f} credits")
     print(f"  Sheet: https://docs.google.com/spreadsheets/d/{spreadsheet_id}")
