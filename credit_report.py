@@ -183,7 +183,7 @@ def get_daily_breakdowns(customer_id, start_date, end_date):
 
     return all_data
 
-def build_daily_usage(customer_id, months_back=2):
+def build_daily_usage(customer_id, months_back=2, plan_start=None):
     """Build daily usage that matches invoice totals exactly."""
 
     # Step 1: Get invoice totals (source of truth)
@@ -197,6 +197,14 @@ def build_daily_usage(customer_id, months_back=2):
     start_date = current_month_start
     for _ in range(months_back):
         start_date = (start_date - timedelta(days=1)).replace(day=1)
+    if plan_start and plan_start > start_date:
+        if plan_start.day > 1:
+            if plan_start.month == 12:
+                start_date = plan_start.replace(year=plan_start.year + 1, month=1, day=1)
+            else:
+                start_date = plan_start.replace(month=plan_start.month + 1, day=1)
+        else:
+            start_date = plan_start
 
     if today.month == 12:
         end_date = today.replace(year=today.year + 1, month=1, day=1)
@@ -323,17 +331,29 @@ def build_daily_usage(customer_id, months_back=2):
     return list(daily_usage.values()), monthly_invoice_totals
 
 def get_current_balance(grants):
-    """Get current credit balance from all grants."""
+    """Get current credit balance from active grants only."""
+    now = datetime.now(tz=__import__('datetime').timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
     total_granted = 0
     total_balance = 0
+    earliest_active = None
 
     for grant in grants:
+        effective_at = grant.get('effective_at', '')
+        expires_at = grant.get('expires_at', '')
+        if effective_at > now or expires_at <= now:
+            continue
         grant_amount = grant.get('grant_amount', {}).get('amount', 0)
-        balance = grant.get('balance', {}).get('excluding_pending', 0)
+        balance = grant.get('balance', {}).get('including_pending', 0)
         total_granted += grant_amount
         total_balance += balance
+        if earliest_active is None or effective_at < earliest_active:
+            earliest_active = effective_at
 
-    return total_granted, total_balance
+    plan_start = None
+    if earliest_active:
+        plan_start = datetime.strptime(earliest_active[:10], '%Y-%m-%d')
+
+    return total_granted, total_balance, plan_start
 
 def ensure_sheet_exists(service, spreadsheet_id, sheet_name):
     """Ensure a sheet exists, create if not."""
@@ -502,7 +522,7 @@ def update_spreadsheet(service, spreadsheet_id, customer_name, daily_usage, invo
     ).execute()
 
     # Credit Usage Summary
-    total_granted, total_balance = get_current_balance(grants)
+    total_granted, total_balance, _ = get_current_balance(grants)
     total_used = total_granted - total_balance
 
     summary = [
@@ -570,16 +590,18 @@ def process_customer(service, customer, customers, customers_modified):
 
     print(f"  Found {len(grants)} grants")
 
+    # Get balance and plan start date
+    total_granted, total_balance, plan_start = get_current_balance(grants)
+
     # Build daily usage
     print(f"  Building daily usage (reconciled with invoices)...")
-    daily_usage, invoice_totals = build_daily_usage(customer_id, months_back=2)
+    daily_usage, invoice_totals = build_daily_usage(customer_id, months_back=2, plan_start=plan_start)
     print(f"  Found {len(daily_usage)} days of data")
 
     # Update spreadsheet
     monthly_totals = update_spreadsheet(service, spreadsheet_id, customer_name, daily_usage, invoice_totals, grants)
 
     # Print summary
-    total_granted, total_balance = get_current_balance(grants)
     print(f"\n  Summary:")
     print(f"    Balance: {total_balance:,.2f} credits")
     for month in sorted(monthly_totals.keys()):
