@@ -7,7 +7,7 @@ Processes all customers from customers.json config.
 
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import requests
 from google.oauth2 import service_account
@@ -484,8 +484,40 @@ def update_spreadsheet(service, spreadsheet_id, customer_name, daily_usage, invo
         'RT Lookback',
         'RT Products',
         'Other',
-        'Total Credits Used'
+        'Total Credits Used',
+        'Credits Remaining'
     ]]
+
+    # --- Running "Credits Remaining" burn-down (current contract year) ---
+    # Anchor the most recent day to Metronome's live Available Balance (current
+    # contract year) so the top row ties to the Credits tab exactly, then walk
+    # backward in time adding each day's usage. Anchoring to the authoritative
+    # balance (rather than summing daily usage forward from the grants) keeps
+    # today's number exact instead of letting per-day reconciliation noise
+    # accumulate onto it. Early days are capped at the amount granted as of that
+    # date so the series doesn't show more than had been granted (e.g. before a
+    # mid-contract grant is added).
+    now_iso = datetime.now(tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+    active_grants = []
+    for g in grants:
+        eff = g.get('effective_at', '')
+        exp = g.get('expires_at', '')
+        if eff and exp and eff <= now_iso < exp:
+            active_grants.append((eff[:10], g.get('grant_amount', {}).get('amount', 0)))
+    contract_start = min((e for e, _ in active_grants), default=None)
+
+    remaining_by_date = {}
+    if contract_start and active_grants:
+        live_summary, _ = get_current_balance(grants)
+        running = live_summary['current']['available']
+        contract_days = sorted(
+            [d for d in daily_usage if d['date'] >= contract_start],
+            key=lambda x: x.get('date', '')
+        )
+        for d in reversed(contract_days):  # most recent first
+            granted_so_far = sum(amt for eff, amt in active_grants if eff <= d['date'])
+            remaining_by_date[d['date']] = min(running, granted_so_far)
+            running += d['total']
 
     daily_rows = []
     monthly_totals = {}
@@ -506,6 +538,9 @@ def update_spreadsheet(service, spreadsheet_id, customer_name, daily_usage, invo
         monthly_totals[month]['other'] += d['other']
         monthly_totals[month]['total'] += d['total']
 
+        rem = remaining_by_date.get(d['date'])
+        rem_cell = round(rem, 2) if rem is not None else ''
+
         daily_rows.append([
             month,
             d['date'],
@@ -514,13 +549,14 @@ def update_spreadsheet(service, spreadsheet_id, customer_name, daily_usage, invo
             round(d['lookback'], 2),
             round(d['rt_products'], 2),
             round(d['other'], 2),
-            round(d['total'], 2)
+            round(d['total'], 2),
+            rem_cell
         ])
 
     # Write daily data
     service.spreadsheets().values().clear(
         spreadsheetId=spreadsheet_id,
-        range='Daily Usage!A:H'
+        range='Daily Usage!A:I'
     ).execute()
 
     service.spreadsheets().values().update(
@@ -538,12 +574,24 @@ def update_spreadsheet(service, spreadsheet_id, customer_name, daily_usage, invo
         'RT Lookback',
         'RT Products',
         'Other',
-        'Total Credits Used'
+        'Total Credits Used',
+        'Credits Remaining'
     ]]
+
+    # End-of-month remaining balance: the running remaining on the latest day of
+    # each month (for the current month this is today's live balance). Iterating
+    # dates ascending means the last write per month wins = month-end value.
+    month_end_remaining = {}
+    for date in sorted(remaining_by_date):
+        month_end_remaining[date[:7]] = remaining_by_date[date]
 
     monthly_rows = []
     for month in sorted(monthly_totals.keys(), key=lambda mk: datetime.strptime(mk, '%b %Y'), reverse=True):
         m = monthly_totals[month]
+
+        month_key = datetime.strptime(month, '%b %Y').strftime('%Y-%m')
+        rem = month_end_remaining.get(month_key)
+        rem_cell = round(rem, 2) if rem is not None else ''
 
         monthly_rows.append([
             month,
@@ -552,12 +600,13 @@ def update_spreadsheet(service, spreadsheet_id, customer_name, daily_usage, invo
             round(m['lookback'], 2),
             round(m['rt_products'], 2),
             round(m['other'], 2),
-            round(m['total'], 2)
+            round(m['total'], 2),
+            rem_cell
         ])
 
     service.spreadsheets().values().clear(
         spreadsheetId=spreadsheet_id,
-        range='Monthly Summary!A:G'
+        range='Monthly Summary!A:H'
     ).execute()
 
     service.spreadsheets().values().update(
