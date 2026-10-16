@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from overage_calculations import CREDIT_ID, HEADERS, summarize
 
 # Load environment variables
 load_dotenv()
@@ -117,12 +118,12 @@ def get_all_customers():
         resp = requests.get(
             f'{BASE_URL}/v1/customers',
             headers=get_headers(),
-            params=params
+            params=params, timeout=45
         )
 
         if resp.status_code != 200:
             print(f"Error fetching customers: {resp.status_code} - {resp.text}")
-            break
+            resp.raise_for_status()
 
         data = resp.json()
         customers.extend(data.get('data', []))
@@ -152,11 +153,11 @@ def get_customer_invoices(customer_id, start_date, end_date):
         resp = requests.get(
             f'{BASE_URL}/v1/customers/{customer_id}/invoices',
             headers=get_headers(),
-            params=params
+            params=params, timeout=45
         )
 
         if resp.status_code != 200:
-            return []
+            resp.raise_for_status()
 
         data = resp.json()
         invoices.extend(data.get('data', []))
@@ -168,175 +169,41 @@ def get_customer_invoices(customer_id, start_date, end_date):
     return invoices
 
 
-def get_customer_balances(customer_id):
-    """Get all balances (commits + credits) for a customer."""
-    resp = requests.get(
-        f'{BASE_URL}/v1/customers/{customer_id}/balances',
-        headers=get_headers(),
-        params={
-            'include_balance': 'true',
-            'include_contract_balances': 'true'
-        }
-    )
-
-    if resp.status_code == 200:
-        return resp.json().get('data', [])
-
-    return get_customer_commits(customer_id)
-
-
-def get_customer_commits(customer_id):
-    """Get commits for a customer."""
-    all_commits = []
-    next_page = None
-
+def get_customer_credit_ledger(customer_id, end_date):
+    """Complete posted credit history through the specified billing close."""
+    pages = []
+    cursor = None
+    seen = set()
     while True:
-        params = {
-            'include_balance': 'true',
-            'include_contract_commits': 'true'
-        }
-        if next_page:
-            params['next_page'] = next_page
-
-        resp = requests.get(
-            f'{BASE_URL}/v1/customers/{customer_id}/commits',
-            headers=get_headers(),
-            params=params
-        )
-
-        if resp.status_code != 200:
-            break
-
-        data = resp.json()
-        all_commits.extend(data.get('data', []))
-        next_page = data.get('next_page')
-
-        if not next_page:
-            break
-
-    return all_commits
-
-
-def get_customer_credits(customer_id):
-    """Get credit grants for a customer."""
-    resp = requests.post(
-        f'{BASE_URL}/v1/credits/listGrants',
-        headers=get_headers(),
-        json={'customer_ids': [customer_id]}
-    )
-
-    if resp.status_code != 200:
-        return []
-
-    return resp.json().get('data', [])
-
-
-def calculate_commit_total(commits):
-    """Sum up total commit value from various response structures."""
-    total = 0
-    for commit in commits:
-        amount = 0
-
-        if 'grant_amount' in commit:
-            amt = commit.get('grant_amount', {})
-            amount = amt.get('amount', 0) if isinstance(amt, dict) else amt
-        elif 'access_schedule' in commit:
-            schedule = commit.get('access_schedule', {})
-            for item in schedule.get('schedule_items', []):
-                amount += item.get('amount', 0)
-        elif 'access_amount' in commit:
-            amt = commit.get('access_amount', {})
-            amount = amt.get('amount', 0) if isinstance(amt, dict) else amt
-        elif 'amount' in commit:
-            amount = commit.get('amount', 0)
-
-        total += amount
-    return total
-
-
-def calculate_remaining_balance(commits):
-    """Get remaining balance from commits/credits."""
-    total = 0
-    for commit in commits:
-        balance = 0
-
-        if 'balance' in commit:
-            bal = commit.get('balance', {})
-            if isinstance(bal, dict):
-                balance = bal.get('excluding_pending') or bal.get('including_pending') or bal.get('amount', 0)
-            else:
-                balance = bal
-        elif 'available_balance' in commit:
-            balance = commit.get('available_balance', 0)
-
-        total += balance
-    return total
-
-
-def parse_invoice_totals(invoices):
-    """Parse invoices into a single total. Converts cents to dollars if needed."""
-    total = 0
-    is_cents = False
-    count = 0
-
-    for inv in invoices:
-        status = inv.get('status', '')
-        if status not in ['FINALIZED', 'DRAFT']:
-            continue
-
-        credit_type = inv.get('credit_type', {})
-        if isinstance(credit_type, dict) and 'cents' in credit_type.get('name', '').lower():
-            is_cents = True
-
-        total += inv.get('total', 0)
-        count += 1
-
-    if is_cents:
-        total = total / 100
-
-    return total, is_cents, count
+        params = {'limit': 100}
+        if cursor:
+            params['next_page'] = cursor
+        resp = requests.post(
+            f'{BASE_URL}/v1/credits/listEntries', headers=get_headers(),
+            params=params, timeout=45,
+            json={'customer_ids': [customer_id], 'credit_type_ids': [CREDIT_ID],
+                  'ending_before': end_date})
+        resp.raise_for_status()
+        payload = resp.json()
+        pages.extend(payload.get('data', []))
+        cursor = payload.get('next_page')
+        if not cursor:
+            return pages
+        if cursor in seen:
+            raise ValueError('Repeated credit ledger pagination cursor')
+        seen.add(cursor)
 
 
 def audit_customer(customer, start_date, end_date):
-    """Audit a single customer for overages in a given month."""
-    customer_id = customer.get('id')
-    customer_name = customer.get('name', 'Unknown')
-
+    """Monthly finalized billing plus historical all-time credit availability."""
+    customer_id = customer['id']
     invoices = get_customer_invoices(customer_id, start_date, end_date)
-
     if not invoices:
         return None
-
-    balances = get_customer_balances(customer_id)
-    commits = get_customer_commits(customer_id)
-    credits = get_customer_credits(customer_id)
-
-    all_financial = balances + commits + credits
-
-    invoice_total, is_cents, invoice_count = parse_invoice_totals(invoices)
-    commit_total = calculate_commit_total(all_financial)
-    remaining_balance = calculate_remaining_balance(all_financial)
-
-    if is_cents:
-        commit_total = commit_total / 100
-        remaining_balance = remaining_balance / 100
-
-    used_credits = commit_total - remaining_balance if commit_total > 0 else invoice_total
-    overage = max(0, invoice_total - commit_total) if commit_total > 0 else 0
-    utilization_pct = (used_credits / commit_total * 100) if commit_total > 0 else 0
-
-    return {
-        'customer_id': customer_id,
-        'customer_name': customer_name,
-        'commit_total': commit_total,
-        'remaining_balance': remaining_balance,
-        'used_credits': used_credits,
-        'invoice_total': invoice_total,
-        'overage': overage,
-        'utilization_pct': utilization_pct,
-        'invoice_count': invoice_count,
-        'has_overage': overage > 0 or utilization_pct > 100,
-    }
+    pages = get_customer_credit_ledger(customer_id, end_date)
+    result = summarize(invoices, pages, start_date, end_date)
+    result.update(customer_id=customer_id, customer_name=customer.get('name', 'Unknown'))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -379,35 +246,44 @@ def write_month_tab(service, spreadsheet_id, tab_name, results):
     """Write a single month's audit results to a tab."""
     ensure_sheet_exists(service, spreadsheet_id, tab_name)
 
-    header = [
-        'Customer Name',
-        'Customer ID',
-        'Commit Total',
-        'Used Credits',
-        'Remaining Balance',
-        'Invoice Total',
-        'Overage Amount',
-        'Utilization %',
-        'Invoice Count',
-        'Has Overage',
-    ]
-
+    header = HEADERS
+    ordered = sorted(results, key=lambda x: (x['overage'] is not None, x['overage'] or 0), reverse=True)
+    def value(number):
+        return number if number is not None else ''
     rows = [header]
-    for r in sorted(results, key=lambda x: x['overage'], reverse=True):
+    for r in ordered:
         rows.append([
-            r['customer_name'],
-            r['customer_id'],
-            round(r['commit_total'], 2),
-            round(r['used_credits'], 2),
-            round(r['remaining_balance'], 2),
-            round(r['invoice_total'], 2),
-            round(r['overage'], 2),
-            f"{r['utilization_pct']:.1f}%",
-            r['invoice_count'],
-            'YES' if r['has_overage'] else 'NO',
+            r['customer_name'], r['customer_id'], value(r['commit_total']),
+            value(r['used_credits']), value(r['remaining_balance']),
+            value(r['invoice_total']), value(r['overage']),
+            f"{r['utilization_pct']:.1f}%" if r['utilization_pct'] is not None else '',
+            r['invoice_count'], r['audit_status'],
         ])
 
     write_sheet(service, spreadsheet_id, tab_name, rows)
+    metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id,
+        fields='sheets.properties').execute()
+    sheet_id = next(s['properties']['sheetId'] for s in metadata['sheets']
+                    if s['properties']['title'] == tab_name)
+    requests_body = []
+    # Fit revised headers and display credit units without rounding stored values.
+    for col, width in [(2, 145), (3, 190), (4, 150), (7, 145)]:
+        requests_body.append({'updateDimensionProperties': {
+            'range': {'sheetId': sheet_id, 'dimension': 'COLUMNS', 'startIndex': col, 'endIndex': col+1},
+            'properties': {'pixelSize': width}, 'fields': 'pixelSize'}})
+        if col != 7:
+            requests_body.append({'repeatCell': {'range': {'sheetId': sheet_id,
+                'startRowIndex': 1, 'endRowIndex': len(rows), 'startColumnIndex': col, 'endColumnIndex': col+1},
+                'cell': {'userEnteredFormat': {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.00'}}},
+                'fields': 'userEnteredFormat.numberFormat'}})
+    requests_body.append({'repeatCell': {'range': {'sheetId': sheet_id,
+        'startRowIndex': 0, 'endRowIndex': 1, 'startColumnIndex': 0, 'endColumnIndex': 10},
+        'cell': {'userEnteredFormat': {'wrapStrategy': 'WRAP'}}, 'fields': 'userEnteredFormat.wrapStrategy'}})
+    requests_body.append({'updateDimensionProperties': {
+        'range': {'sheetId': sheet_id, 'dimension': 'ROWS', 'startIndex': 0, 'endIndex': 1},
+        'properties': {'pixelSize': 60}, 'fields': 'pixelSize'}})
+    service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id,
+        body={'requests': requests_body}).execute()
     print(f"  Wrote {len(results)} rows to tab '{tab_name}'")
 
 
@@ -432,7 +308,7 @@ def update_summary_tab(service, spreadsheet_id, month_label, results):
 
     # Upsert current month
     overage_count = sum(1 for r in results if r['has_overage'])
-    total_overage = sum(r['overage'] for r in results)
+    total_overage = sum(r['overage'] for r in results if r['overage'] is not None)
 
     data_map[month_label] = [
         month_label,
@@ -453,7 +329,8 @@ def update_summary_tab(service, spreadsheet_id, month_label, results):
     rows = [header] + [data_map[m] for m in sorted_months]
 
     write_sheet(service, spreadsheet_id, 'Summary', rows)
-    print(f"  Updated Summary tab ({len(sorted_months)} months)")
+    review_count = sum(r['audit_status'] == 'REVIEW' for r in results)
+    print(f"  Updated Summary tab ({len(sorted_months)} months); {review_count} row(s) require review")
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +341,8 @@ def main():
     parser = argparse.ArgumentParser(description='Monthly Metronome Overage Audit')
     parser.add_argument('--month', type=str, default=None,
                         help='Month to audit in YYYY-MM format (default: previous month)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Read Metronome and print results without accessing Google Sheets')
     args = parser.parse_args()
 
     start_date, end_date, month_label = get_audit_month(args.month)
@@ -474,14 +353,6 @@ def main():
     print(f"Period: {start_date[:10]} to {end_date[:10]}")
     print(f"Run Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("=" * 60)
-
-    # Google Sheets auth
-    print("\nAuthenticating with Google...")
-    creds = get_google_creds()
-    sheets_service = build('sheets', 'v4', credentials=creds)
-
-    spreadsheet_id = get_spreadsheet_id()
-    print(f"Spreadsheet: https://docs.google.com/spreadsheets/d/{spreadsheet_id}")
 
     # Get all Metronome customers
     customers = get_all_customers()
@@ -503,6 +374,8 @@ def main():
             results.append(result)
             if result['has_overage']:
                 print(f"OVERAGE: ${result['overage']:,.2f}")
+            elif result['audit_status'] == 'REVIEW':
+                print('REVIEW: finalized billing evidence missing or unsupported')
             elif result['invoice_total'] > 0:
                 print(f"OK (${result['invoice_total']:,.2f})")
             else:
@@ -513,6 +386,18 @@ def main():
     if not results:
         print("No audit results to write.")
         return
+
+    if args.dry_run:
+        print(json.dumps({'month': month_label, 'results': results}, indent=2))
+        return results
+
+    # Google Sheets auth
+    print("\nAuthenticating with Google...")
+    creds = get_google_creds()
+    sheets_service = build('sheets', 'v4', credentials=creds)
+
+    spreadsheet_id = get_spreadsheet_id()
+    print(f"Spreadsheet: https://docs.google.com/spreadsheets/d/{spreadsheet_id}")
 
     # Write to Google Sheets
     print(f"\nWriting results to Google Sheets...")
@@ -537,10 +422,10 @@ def main():
         print("=" * 60)
         for r in sorted(overage_accounts, key=lambda x: x['overage'], reverse=True):
             print(f"\n{r['customer_name']}")
-            print(f"  Commit: ${r['commit_total']:,.2f}")
+            print(f"  All-time credits granted: {r['commit_total']}")
             print(f"  Invoiced: ${r['invoice_total']:,.2f}")
             print(f"  Overage: ${r['overage']:,.2f}")
-            print(f"  Utilization: {r['utilization_pct']:.1f}%")
+            print(f"  Credits unavailable %: {r['utilization_pct']}")
 
     return results
 
