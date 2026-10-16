@@ -20,7 +20,8 @@ from dotenv import load_dotenv
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from overage_calculations import CREDIT_ID, HEADERS, summarize
+from overage_calculations import CREDIT_ID, summarize
+from overage_publication import publish_report
 
 # Load environment variables
 load_dotenv()
@@ -62,37 +63,6 @@ def get_spreadsheet_id():
     return OVERAGE_SPREADSHEET_ID
 
 
-def ensure_sheet_exists(service, spreadsheet_id, sheet_name):
-    """Ensure a sheet/tab exists, create if not."""
-    sheet_metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    sheets = [s['properties']['title'] for s in sheet_metadata.get('sheets', [])]
-
-    if sheet_name not in sheets:
-        service.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={'requests': [{'addSheet': {'properties': {'title': sheet_name}}}]}
-        ).execute()
-
-
-def write_sheet(service, spreadsheet_id, sheet_name, rows):
-    """Clear and write rows to a sheet tab."""
-    # Determine column range from widest row
-    max_cols = max(len(r) for r in rows) if rows else 1
-    col_letter = chr(ord('A') + max_cols - 1)
-
-    service.spreadsheets().values().clear(
-        spreadsheetId=spreadsheet_id,
-        range=f'{sheet_name}!A:{col_letter}'
-    ).execute()
-
-    service.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=f'{sheet_name}!A1',
-        valueInputOption='RAW',
-        body={'values': rows}
-    ).execute()
-
-
 # ---------------------------------------------------------------------------
 # Metronome API helpers (kept from original overage_audit.py)
 # ---------------------------------------------------------------------------
@@ -104,94 +74,49 @@ def get_headers():
     }
 
 
-def get_all_customers():
-    """Get all customers from Metronome with pagination."""
-    print("Fetching all customers...")
-    customers = []
-    next_page = None
-
+def get_api_pages(path, body=None, params=None):
+    """Retrieve complete data or fail; malformed responses are not empty data."""
+    output = []
+    query = dict(params or {})
+    query.setdefault('limit', 100)
+    seen = set()
     while True:
-        params = {'limit': 100}
-        if next_page:
-            params['next_page'] = next_page
+        if body is None:
+            response = requests.get(BASE_URL + path, headers=get_headers(), params=query, timeout=45)
+        else:
+            response = requests.post(BASE_URL + path, headers=get_headers(), params=query,
+                                     json=body, timeout=45)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get('data'), list):
+            raise ValueError('Malformed Metronome data response: ' + path)
+        output.extend(payload['data'])
+        cursor = payload.get('next_page')
+        if cursor is None or cursor == '':
+            return output
+        if not isinstance(cursor, str) or cursor in seen:
+            raise ValueError('Invalid or repeated Metronome pagination cursor: ' + path)
+        seen.add(cursor)
+        query = {**query, 'next_page': cursor}
 
-        resp = requests.get(
-            f'{BASE_URL}/v1/customers',
-            headers=get_headers(),
-            params=params, timeout=45
-        )
 
-        if resp.status_code != 200:
-            print(f"Error fetching customers: {resp.status_code} - {resp.text}")
-            resp.raise_for_status()
-
-        data = resp.json()
-        customers.extend(data.get('data', []))
-        next_page = data.get('next_page')
-
-        if not next_page:
-            break
-
-    print(f"Found {len(customers)} total customers")
+def get_all_customers():
+    print('Fetching all customers...')
+    customers = get_api_pages('/v1/customers')
+    if len({c['id'] for c in customers}) != len(customers):
+        raise ValueError('Duplicate customer in Metronome response')
+    print(f'Found {len(customers)} total customers')
     return customers
 
 
 def get_customer_invoices(customer_id, start_date, end_date):
-    """Get invoices for a customer in date range."""
-    invoices = []
-    next_page = None
-
-    while True:
-        params = {
-            'starting_on': start_date,
-            'ending_before': end_date,
-            'limit': 100
-        }
-        if next_page:
-            params['next_page'] = next_page
-
-        resp = requests.get(
-            f'{BASE_URL}/v1/customers/{customer_id}/invoices',
-            headers=get_headers(),
-            params=params, timeout=45
-        )
-
-        if resp.status_code != 200:
-            resp.raise_for_status()
-
-        data = resp.json()
-        invoices.extend(data.get('data', []))
-        next_page = data.get('next_page')
-
-        if not next_page:
-            break
-
-    return invoices
+    return get_api_pages(f'/v1/customers/{customer_id}/invoices', params={
+        'starting_on': start_date, 'ending_before': end_date})
 
 
 def get_customer_credit_ledger(customer_id, end_date):
-    """Complete posted credit history through the specified billing close."""
-    pages = []
-    cursor = None
-    seen = set()
-    while True:
-        params = {'limit': 100}
-        if cursor:
-            params['next_page'] = cursor
-        resp = requests.post(
-            f'{BASE_URL}/v1/credits/listEntries', headers=get_headers(),
-            params=params, timeout=45,
-            json={'customer_ids': [customer_id], 'credit_type_ids': [CREDIT_ID],
-                  'ending_before': end_date})
-        resp.raise_for_status()
-        payload = resp.json()
-        pages.extend(payload.get('data', []))
-        cursor = payload.get('next_page')
-        if not cursor:
-            return pages
-        if cursor in seen:
-            raise ValueError('Repeated credit ledger pagination cursor')
-        seen.add(cursor)
+    return get_api_pages('/v1/credits/listEntries', body={
+        'customer_ids': [customer_id], 'credit_type_ids': [CREDIT_ID], 'ending_before': end_date})
 
 
 def audit_customer(customer, start_date, end_date):
@@ -239,101 +164,6 @@ def get_audit_month(month_arg=None):
 
 
 # ---------------------------------------------------------------------------
-# Google Sheets output
-# ---------------------------------------------------------------------------
-
-def write_month_tab(service, spreadsheet_id, tab_name, results):
-    """Write a single month's audit results to a tab."""
-    ensure_sheet_exists(service, spreadsheet_id, tab_name)
-
-    header = HEADERS
-    ordered = sorted(results, key=lambda x: (x['overage'] is not None, x['overage'] or 0), reverse=True)
-    def value(number):
-        return number if number is not None else ''
-    rows = [header]
-    for r in ordered:
-        rows.append([
-            r['customer_name'], r['customer_id'], value(r['commit_total']),
-            value(r['used_credits']), value(r['remaining_balance']),
-            value(r['invoice_total']), value(r['overage']),
-            f"{r['utilization_pct']:.1f}%" if r['utilization_pct'] is not None else '',
-            r['invoice_count'], r['audit_status'],
-        ])
-
-    write_sheet(service, spreadsheet_id, tab_name, rows)
-    metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id,
-        fields='sheets.properties').execute()
-    sheet_id = next(s['properties']['sheetId'] for s in metadata['sheets']
-                    if s['properties']['title'] == tab_name)
-    requests_body = []
-    # Fit revised headers and display credit units without rounding stored values.
-    for col, width in [(2, 145), (3, 190), (4, 150), (7, 145)]:
-        requests_body.append({'updateDimensionProperties': {
-            'range': {'sheetId': sheet_id, 'dimension': 'COLUMNS', 'startIndex': col, 'endIndex': col+1},
-            'properties': {'pixelSize': width}, 'fields': 'pixelSize'}})
-        if col != 7:
-            requests_body.append({'repeatCell': {'range': {'sheetId': sheet_id,
-                'startRowIndex': 1, 'endRowIndex': len(rows), 'startColumnIndex': col, 'endColumnIndex': col+1},
-                'cell': {'userEnteredFormat': {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.00'}}},
-                'fields': 'userEnteredFormat.numberFormat'}})
-    requests_body.append({'repeatCell': {'range': {'sheetId': sheet_id,
-        'startRowIndex': 0, 'endRowIndex': 1, 'startColumnIndex': 0, 'endColumnIndex': 10},
-        'cell': {'userEnteredFormat': {'wrapStrategy': 'WRAP'}}, 'fields': 'userEnteredFormat.wrapStrategy'}})
-    requests_body.append({'updateDimensionProperties': {
-        'range': {'sheetId': sheet_id, 'dimension': 'ROWS', 'startIndex': 0, 'endIndex': 1},
-        'properties': {'pixelSize': 60}, 'fields': 'pixelSize'}})
-    service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id,
-        body={'requests': requests_body}).execute()
-    print(f"  Wrote {len(results)} rows to tab '{tab_name}'")
-
-
-def update_summary_tab(service, spreadsheet_id, month_label, results):
-    """Append/update a row on the Summary tab for this month's run."""
-    ensure_sheet_exists(service, spreadsheet_id, 'Summary')
-
-    # Read existing summary data
-    resp = service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range='Summary!A:E'
-    ).execute()
-    existing = resp.get('values', [])
-
-    header = ['Month', 'Customers Audited', 'Overages Found', 'Total Overage $', 'Run Date']
-
-    # Build data map from existing rows (skip header)
-    data_map = {}
-    for row in existing[1:] if len(existing) > 1 else []:
-        if row:
-            data_map[row[0]] = row
-
-    # Upsert current month
-    overage_count = sum(1 for r in results if r['has_overage'])
-    total_overage = sum(r['overage'] for r in results if r['overage'] is not None)
-
-    data_map[month_label] = [
-        month_label,
-        len(results),
-        overage_count,
-        round(total_overage, 2),
-        datetime.now().strftime('%Y-%m-%d %H:%M'),
-    ]
-
-    # Sort by month label chronologically
-    def sort_key(label):
-        try:
-            return datetime.strptime(label, '%b-%Y')
-        except ValueError:
-            return datetime.min
-
-    sorted_months = sorted(data_map.keys(), key=sort_key)
-    rows = [header] + [data_map[m] for m in sorted_months]
-
-    write_sheet(service, spreadsheet_id, 'Summary', rows)
-    review_count = sum(r['audit_status'] == 'REVIEW' for r in results)
-    print(f"  Updated Summary tab ({len(sorted_months)} months); {review_count} row(s) require review")
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -343,6 +173,8 @@ def main():
                         help='Month to audit in YYYY-MM format (default: previous month)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Read Metronome and print results without accessing Google Sheets')
+    parser.add_argument('--replace-existing', action='store_true',
+                        help='Allow intentional full-month regeneration of an existing tab')
     args = parser.parse_args()
 
     start_date, end_date, month_label = get_audit_month(args.month)
@@ -401,8 +233,8 @@ def main():
 
     # Write to Google Sheets
     print(f"\nWriting results to Google Sheets...")
-    write_month_tab(sheets_service, spreadsheet_id, month_label, results)
-    update_summary_tab(sheets_service, spreadsheet_id, month_label, results)
+    publish_report(sheets_service, spreadsheet_id, month_label, results,
+                   allow_replace=args.replace_existing)
 
     # Console summary
     overage_accounts = [r for r in results if r['has_overage']]

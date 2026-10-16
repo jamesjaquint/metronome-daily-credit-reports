@@ -44,5 +44,5 @@ class AuditTests(unittest.TestCase):
   self.assertAlmostEqual(r['used_credits'],1184.3226365967741)
   self.assertEqual(r['expired_credits'],0)
  def test_invoice_from_next_month_is_excluded(self):
-  i=invoice(10000);i['start_timestamp']='2026-09-01T00:00:00Z';r=self.result([invoice(),i]);self.assertEqual(r['invoice_total'],0)
+  i=invoice(10000);i['id']='next-month';i['start_timestamp']='2026-09-01T00:00:00Z';r=self.result([invoice(),i]);self.assertEqual(r['invoice_total'],0)
 if __name__=='__main__':unittest.main()

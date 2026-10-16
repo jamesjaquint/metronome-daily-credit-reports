@@ -19,6 +19,20 @@ class APITests(unittest.TestCase):
    with self.assertRaisesRegex(RuntimeError,'API unavailable'):audit.get_customer_invoices('customer','2026-08-01','2026-09-01')
  def test_dry_run_does_not_access_google_or_write_sheet(self):
   result={'has_overage':False,'audit_status':'NO','invoice_total':0}
-  with patch('sys.argv',['overage_audit.py','--month','2026-08','--dry-run']),patch.object(audit,'get_all_customers',return_value=[{'id':'c','name':'Test'}]),patch.object(audit,'audit_customer',return_value=result),patch.object(audit,'get_google_creds') as creds,patch.object(audit,'write_month_tab') as write,contextlib.redirect_stdout(io.StringIO()):
+  with patch('sys.argv',['overage_audit.py','--month','2026-08','--dry-run']),patch.object(audit,'get_all_customers',return_value=[{'id':'c','name':'Test'}]),patch.object(audit,'audit_customer',return_value=result),patch.object(audit,'get_google_creds') as creds,patch.object(audit,'publish_report') as write,contextlib.redirect_stdout(io.StringIO()):
    audit.main()
   creds.assert_not_called();write.assert_not_called()
+
+class ResponseGuardTests(unittest.TestCase):
+ def test_success_status_without_data_is_not_an_empty_invoice_list(self):
+  response=Mock();response.json.return_value={'message':'incomplete response'}
+  with patch.object(audit.requests,'get',return_value=response):
+   with self.assertRaisesRegex(ValueError,'Malformed'):audit.get_customer_invoices('customer','2026-08-01','2026-09-01')
+ def test_repeated_cursor_stops_instead_of_looping_forever(self):
+  response=Mock();response.json.return_value={'data':[],'next_page':'same'}
+  with patch.object(audit.requests,'get',return_value=response):
+   with self.assertRaisesRegex(ValueError,'repeated'):audit.get_customer_invoices('customer','2026-08-01','2026-09-01')
+ def test_numeric_cursor_is_rejected(self):
+  response=Mock();response.json.return_value={'data':[],'next_page':123}
+  with patch.object(audit.requests,'get',return_value=response):
+   with self.assertRaisesRegex(ValueError,'cursor'):audit.get_all_customers()
